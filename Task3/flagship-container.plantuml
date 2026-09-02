@@ -1,0 +1,104 @@
+@startuml flagship-container
+' C4 Container. Автоматическое выявление подозрительных операций по счетам
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+skinparam wrapWidth 200
+
+AddElementTag("code",  $bgColor="#1168BD", $fontColor="#FFFFFF", $legendText="Обычный код")
+AddElementTag("model", $bgColor="#7B3FA0", $fontColor="#FFFFFF", $legendText="ML-модель")
+AddElementTag("queue", $bgColor="#C77700", $fontColor="#FFFFFF", $legendText="Очередь")
+AddElementTag("human", $bgColor="#2E7D32", $fontColor="#FFFFFF", $legendText="Человек")
+AddElementTag("store", $bgColor="#4B5A66", $fontColor="#FFFFFF", $legendText="Данные")
+AddElementTag("batch", $bgColor="#8A6D3B", $fontColor="#FFFFFF", $legendText="Пакетный расчёт")
+
+AddRelTag("sync",     $textColor="#1168BD", $lineColor="#1168BD", $legendText="Синхронно (до 300 мс)")
+AddRelTag("async",    $textColor="#C77700", $lineColor="#C77700", $lineStyle=DashedLine(), $legendText="Асинхронно")
+AddRelTag("batch",    $textColor="#8A6D3B", $lineColor="#8A6D3B", $lineStyle=DottedLine(), $legendText="Пакетно, раз в сутки")
+AddRelTag("fallback", $textColor="#B00020", $lineColor="#B00020", $lineStyle=BoldLine(), $legendText="Fallback")
+
+Person(client, "Клиент", "Совершает операцию")
+Person(analyst, "Аналитик финмона", "Разбирает ~10 тыс. кейсов в месяц", $tags="human")
+System_Ext(abs, "АБС / процессинг", "Проводит, придерживает или блокирует операцию")
+System_Ext(feedback, "Поддержка и регулятор", "Жалобы клиентов и запросы регулятора — источник правильных ответов")
+
+System_Boundary(aml, "Система выявления подозрительных операций (on-premise)") {
+  Container(api, "Сервис проверки операции", "Java", "Правила, вызов модели, решение по порогам. Детализация — на C4-Component", $tags="code")
+  Container(features, "Сервис признаков", "Redis + Postgres", "Агрегаты по клиенту и контрагенту, флаги стоп-листов, свежесть признаков", $tags="store")
+  Container(model_base, "Модель: базовая", "GBDT", "Вероятность схемной операции", $tags="model")
+  Container(model_heavy, "Модель: усиленная", "Ансамбль", "Для крупных сумм и рисковых сегментов: другие веса и порог", $tags="model")
+  Container(queue, "Очередь на ручной разбор", "Kafka + case management", "Кейсы с приоритетом, квота 10 тыс./мес", $tags="queue")
+  Container(ui, "АРМ аналитика", "Web UI", "Карточка кейса: решение, причины, значения признаков, связанные операции", $tags="code")
+  ContainerDb(audit, "Журнал решений", "Postgres", "Что решили, на каких признаках и какой версией модели", $tags="store")
+  Container(batch, "Ночной пересчёт и переобучение", "Spark + MLflow", "Ретро-скоринг за сутки, сбор меток, обучение и промоут новой версии", $tags="batch")
+  Container(mon, "Мониторинг", "Grafana", "Метрики входа, модели, очереди и бизнеса", $tags="code")
+}
+
+Rel(client, abs, "Платёж", $tags="sync")
+Rel(abs, api, "Проверка до проведения операции", $tags="sync")
+Rel(api, features, "Признаки операции", $tags="sync")
+Rel(api, model_base, "Оценка риска", $tags="sync")
+Rel(api, model_heavy, "Оценка риска: крупная сумма", $tags="sync")
+Rel(api, abs, "ALLOW / REVIEW / HOLD / BLOCK", $tags="sync")
+Rel_U(api, api, "Модель или признаки недоступны — решение только по правилам", $tags="fallback")
+
+Rel(api, queue, "Сомнительные кейсы", $tags="async")
+Rel(queue, ui, "Кейс аналитику", $tags="async")
+Rel(analyst, ui, "Подтверждает или отклоняет", $tags="async")
+Rel(ui, abs, "Итоговое действие по операции", $tags="async")
+Rel(ui, audit, "Решение человека", $tags="async")
+Rel(api, audit, "Решение системы", $tags="async")
+Rel(feedback, batch, "Ложные блокировки и пропуски", $tags="async")
+
+Rel(batch, features, "Полные агрегаты за сутки", $tags="batch")
+Rel(batch, queue, "Отложенные кейсы: дробление, транзит", $tags="batch")
+Rel_U(batch, model_base, "Новая версия весов", $tags="batch")
+Rel_U(batch, model_heavy, "Новая версия весов", $tags="batch")
+Rel(ui, batch, "Вердикты как метки", $tags="batch")
+
+Rel(mon, api, "Латентность, доля fallback, распределение оценок", $tags="async")
+Rel(mon, queue, "Глубина очереди и доля подтверждений", $tags="async")
+
+note right of abs
+  **Выходной контракт**
+  decision: ALLOW | REVIEW | HOLD | BLOCK
+  risk_score: 0..1 или null
+  source: правила | базовая | усиленная модель
+  model_version, feature_snapshot_id (ссылка на источник)
+  reason_codes, requires_human, ttl
+  --
+  Перед действием АБС проверяет: схема верна,
+  score в [0,1], решение согласовано с порогом,
+  ответ не просрочен.
+  Нет данных — score = null и REVIEW,
+  пропуск никогда не считается нулём.
+end note
+
+note right of analyst
+  **Уровень автоматизации**
+  Сама: пропуск ниже порога, блокировка по стоп-листу.
+  Рекомендует: оценка и причины в карточке кейса.
+  Требует человека: HOLD по модели, крупные суммы,
+  зона воздержания, клиент без истории.
+end note
+
+note bottom of mon
+  **Мониторинг**
+  Вход: пропуски и устаревание признаков, дрейф.
+  Модель: распределение оценок, доля воздержаний, латентность.
+  Очередь: глубина, ожидание, доля подтверждений вердикта.
+  Бизнес: сколько операций закрыли автоматически, жалобы, пропуски.
+  Откат на прошлую версию или на правила — при дрейфе,
+  росте жалоб или падении доли подтверждений.
+end note
+
+note bottom of features
+  **Безопасность**
+  Ответ модели — данные, а не команда: только число и фиксированная схема.
+  Назначение платежа — текст от клиента, экранируем.
+  Признаки и списки только на чтение, операции меняет лишь АБС.
+  Веса берём из своего хранилища с проверкой контрольной суммы.
+  Персональные данные не выходят за контур, в логах — идентификаторы.
+end note
+
+@enduml

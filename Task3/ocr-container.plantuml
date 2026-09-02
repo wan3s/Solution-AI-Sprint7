@@ -1,0 +1,99 @@
+@startuml ocr-container
+' C4 Container. Распознавание и оцифровка сканов документов к кредитной заявке
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+skinparam wrapWidth 200
+
+AddElementTag("code",  $bgColor="#1168BD", $fontColor="#FFFFFF", $legendText="Обычный код")
+AddElementTag("model", $bgColor="#7B3FA0", $fontColor="#FFFFFF", $legendText="ML-модель")
+AddElementTag("queue", $bgColor="#C77700", $fontColor="#FFFFFF", $legendText="Очередь")
+AddElementTag("human", $bgColor="#2E7D32", $fontColor="#FFFFFF", $legendText="Человек")
+AddElementTag("store", $bgColor="#4B5A66", $fontColor="#FFFFFF", $legendText="Данные")
+AddElementTag("batch", $bgColor="#8A6D3B", $fontColor="#FFFFFF", $legendText="Пакетный расчёт")
+
+AddRelTag("sync",     $textColor="#1168BD", $lineColor="#1168BD", $legendText="Синхронно (загрузка файла)")
+AddRelTag("async",    $textColor="#C77700", $lineColor="#C77700", $lineStyle=DashedLine(), $legendText="Асинхронно (минуты)")
+AddRelTag("batch",    $textColor="#8A6D3B", $lineColor="#8A6D3B", $lineStyle=DottedLine(), $legendText="Пакетно, раз в сутки")
+AddRelTag("fallback", $textColor="#B00020", $lineColor="#B00020", $lineStyle=BoldLine(), $legendText="Fallback")
+
+Person(client, "Клиент", "Загружает сканы и подтверждает распознанные данные", $tags="human")
+Person(operator, "Оператор кредитного отдела", "Проверяет спорные документы", $tags="human")
+System_Ext(los, "Кредитный конвейер", "Принимает заявку и решает по кредиту")
+
+System_Boundary(ocr, "Оцифровка документов (on-premise)") {
+  Container(upload, "Сервис загрузки", "Java", "Проверяет формат, размер и вирусы. Скан это или нет — определяем кодом, без модели", $tags="code")
+  Container(queue, "Очередь на распознавание", "Kafka", "Документ ждёт обработки, повтор безопасен", $tags="queue")
+  Container(worker, "Сервис распознавания", "Java", "Вызывает модели, собирает поля, проверяет результат", $tags="code")
+  Container(ocr_model, "Модель OCR", "Готовая модель, свой контур", "Текст с координатами на странице", $tags="model")
+  Container(extract, "Модель извлечения полей", "NER", "ФИО, ИНН, доход, период, работодатель", $tags="model")
+  Container(validate, "Проверки полей", "Правила", "Контрольная сумма ИНН, формат дат, суммы сходятся, все обязательные поля на месте", $tags="code")
+  Container(review_q, "Очередь на ручную проверку", "Case management", "Документы, где система не уверена", $tags="queue")
+  ContainerDb(docs, "Хранилище документов и результатов", "S3 + Postgres", "Файл, распознанные поля, страница и место на скане для каждого поля", $tags="store")
+  Container(form, "Форма подтверждения данных", "Web UI", "Клиент видит поля рядом с фрагментом скана и правит их", $tags="code")
+  Container(train, "Сбор правок и дообучение", "Airflow + MLflow", "Исправления клиента и оператора — метки для новой версии", $tags="batch")
+  Container(mon, "Мониторинг", "Grafana", "Качество распознавания, доля ручных проверок, задержка", $tags="code")
+}
+
+Rel(client, upload, "Загружает сканы", $tags="sync")
+Rel(upload, docs, "Сохраняет файл", $tags="sync")
+Rel(upload, queue, "Документ в обработку", $tags="async")
+Rel(queue, worker, "Берёт документ", $tags="async")
+Rel(worker, ocr_model, "Распознать текст", $tags="async")
+Rel(worker, extract, "Выделить поля", $tags="async")
+Rel(worker, validate, "Проверить поля", $tags="async")
+Rel(worker, docs, "Поля + ссылка на место на скане", $tags="async")
+Rel(validate, review_q, "Не уверены — на человека", $tags="fallback")
+Rel(review_q, operator, "Документ на проверку", $tags="async")
+Rel(operator, form, "Правит поля", $tags="async")
+Rel(worker, form, "Черновик заполненных полей", $tags="async")
+Rel(client, form, "Проверяет и подтверждает", $tags="async")
+Rel(form, los, "Подтверждённые данные заявки", $tags="async")
+Rel(form, train, "Что клиент и оператор исправили", $tags="batch")
+Rel_U(train, extract, "Новая версия модели", $tags="batch")
+Rel(mon, worker, "Уверенность, доля отказов, задержка", $tags="async")
+Rel(mon, review_q, "Глубина очереди и доля правок", $tags="async")
+
+note right of los
+  **Выходной контракт по документу**
+  document_id, тип документа, статус (готово / нужна проверка / не распознано)
+  поля: значение, уверенность, страница и место на скане (ссылка на источник)
+  model_version, требуется ли подтверждение человека
+  --
+  Поле, которое не нашли, остаётся пустым с причиной,
+  а не заполняется догадкой.
+  Кредитный конвейер принимает данные только после
+  подтверждения клиентом — это и есть проверка до бизнес-действия.
+end note
+
+note right of operator
+  **Уровень автоматизации**
+  Сама: распознаёт и подставляет поля в форму.
+  Рекомендует: показывает значение с уверенностью и фрагментом скана.
+  Требует человека: подтверждение клиента обязательно всегда,
+  оператор — когда поля не сошлись или скан плохой.
+end note
+
+note bottom of validate
+  **Когда уходим на человека**
+  Поля не прошли проверку формата или контрольной суммы.
+  Нет подтверждающего фрагмента на скане.
+  Низкая уверенность модели по обязательному полю.
+  Тип документа незнакомый, скан нечитаемый или перевёрнут.
+  Документы противоречат друг другу (доход в справке и в заявке).
+  Модель недоступна, таймаут, превышены лимиты.
+end note
+
+note bottom of mon
+  **Мониторинг и безопасность**
+  Следим: доля документов без ручной правки, средняя уверенность,
+  доля исправленных клиентом полей, задержка обработки, доля ошибок модели.
+  Резко выросла доля правок — откатываем версию модели.
+  --
+  Документ клиента — недоверенный файл: проверяем формат и вирусы,
+  текст из скана никогда не выполняем как команду.
+  Персональные данные не выходят за контур (поэтому on-premise),
+  доступ к сканам по ролям, все просмотры логируются.
+end note
+
+@enduml
