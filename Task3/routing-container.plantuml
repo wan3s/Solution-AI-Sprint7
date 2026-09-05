@@ -1,0 +1,104 @@
+@startuml routing-container
+' C4 Container. Маршрутизация входящих обращений по отделам
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+skinparam wrapWidth 200
+
+AddElementTag("code",  $bgColor="#1168BD", $fontColor="#FFFFFF", $legendText="Обычный код")
+AddElementTag("model", $bgColor="#7B3FA0", $fontColor="#FFFFFF", $legendText="ML-модель")
+AddElementTag("queue", $bgColor="#C77700", $fontColor="#FFFFFF", $legendText="Очередь")
+AddElementTag("human", $bgColor="#2E7D32", $fontColor="#FFFFFF", $legendText="Человек")
+AddElementTag("store", $bgColor="#4B5A66", $fontColor="#FFFFFF", $legendText="Данные")
+AddElementTag("batch", $bgColor="#8A6D3B", $fontColor="#FFFFFF", $legendText="Пакетный расчёт")
+
+AddRelTag("sync",     $textColor="#1168BD", $lineColor="#1168BD", $legendText="Синхронно (приём обращения)")
+AddRelTag("async",    $textColor="#C77700", $lineColor="#C77700", $lineStyle=DashedLine(), $legendText="Асинхронно (до нескольких минут)")
+AddRelTag("batch",    $textColor="#8A6D3B", $lineColor="#8A6D3B", $lineStyle=DottedLine(), $legendText="Пакетно, раз в сутки")
+AddRelTag("fallback", $textColor="#B00020", $lineColor="#B00020", $lineStyle=BoldLine(), $legendText="Fallback")
+
+Person(client, "Клиент", "Пишет обращение", $tags="human")
+Person(agent, "Оператор отдела", "Отвечает или переадресует, если тема не его", $tags="human")
+Person(dispatcher, "Оператор общей линии", "Разбирает то, что система не смогла отнести", $tags="human")
+System_Ext(channels, "Каналы обращений", "Чат, почта, форма на сайте")
+System_Ext(llm, "Классификатор в облаке провайдера", "Модель размещена вне контура", $tags="model")
+
+System_Boundary(routing, "Маршрутизация обращений") {
+  Container(intake, "Сервис приёма обращений", "Java", "Принимает обращение, отвечает клиенту, что оно зарегистрировано", $tags="code")
+  Container(queue, "Очередь на классификацию", "Kafka", "Обращение ждёт разбора, повтор безопасен", $tags="queue")
+  Container(router, "Сервис маршрутизации", "Java", "Правила, вызов модели, проверка ответа и выбор отдела", $tags="code")
+  Container(mask, "Маскирование данных", "Java", "Убирает номера карт, счетов и паспортов перед отправкой текста наружу", $tags="code")
+  Container(rules, "Правила маршрутизации", "Rule engine", "Явные случаи: ключевые слова, VIP-клиент, жалоба на блокировку — сразу в нужный отдел", $tags="code")
+  ContainerDb(dict, "Справочник отделов", "Postgres", "Какие отделы есть, какие активны, кто что разбирает", $tags="store")
+  Container(dept_q, "Очереди отделов", "Case management", "Обращение попадает в очередь выбранного отдела", $tags="queue")
+  Container(train, "Сбор меток и переобучение", "Airflow + MLflow", "Куда обращение переадресовали в итоге — это и есть правильный ответ", $tags="batch")
+  Container(mon, "Мониторинг", "Grafana", "Точность маршрутизации, доля переадресаций, задержка", $tags="code")
+}
+
+Rel(client, channels, "Обращение", $tags="sync")
+Rel(channels, intake, "Текст обращения", $tags="sync")
+Rel(intake, client, "Принято, ответим в течение SLA", $tags="sync")
+Rel(intake, queue, "Обращение на разбор", $tags="async")
+Rel(queue, router, "Берёт обращение", $tags="async")
+Rel(router, rules, "Проверка явных случаев", $tags="async")
+Rel(router, mask, "Текст перед отправкой наружу", $tags="async")
+Rel(mask, llm, "Обезличенный текст", $tags="async")
+Rel(llm, router, "Отдел и уверенность", $tags="async")
+Rel(router, dict, "Проверка, что отдел существует и активен", $tags="async")
+Rel(router, dept_q, "Обращение в очередь отдела", $tags="async")
+Rel(dept_q, agent, "Обращение оператору", $tags="async")
+Rel(router, dispatcher, "Не уверены или модель недоступна — на общую линию", $tags="fallback")
+Rel(dispatcher, dept_q, "Ставит отдел вручную", $tags="async")
+Rel(agent, dept_q, "Переадресует, если тема не его", $tags="async")
+Rel(dept_q, train, "Итоговый отдел как метка", $tags="batch")
+Rel_U(train, llm, "Новая версия модели", $tags="batch")
+Rel(mon, router, "Уверенность, доля fallback, задержка", $tags="async")
+Rel(mon, dept_q, "Доля переадресаций по отделам", $tags="async")
+
+note right of agent
+  **Выходной контракт**
+  request_id, department_code, уверенность,
+  на чём основано решение (сработавшее правило или похожие обращения),
+  model_version, нужен ли человек.
+  --
+  Перед постановкой в очередь проверяем кодом:
+  department_code есть в справочнике и отдел активен,
+  уверенность выше порога, ответ не просрочен.
+  Отдел не определён — обращение идёт на общую линию,
+  а не в случайный отдел.
+end note
+
+note right of dispatcher
+  **Уровень автоматизации**
+  Сама: ставит отдел, когда уверенность высокая.
+  Рекомендует: подсказывает отдел оператору общей линии.
+  Требует человека: спорные темы, жалобы и всё, что ниже порога.
+  Ошибка не критична — оператор отдела переадресует обращение.
+end note
+
+note bottom of rules
+  **Когда уходим на общую линию или на правила**
+  Уверенность модели около порога.
+  Тема вне того, чему учили: новый продукт, новый отдел.
+  Обращение не на том языке, пустое или это вложение без текста.
+  Модель спорит с явным правилом (например, VIP-клиент).
+  Модель недоступна, таймаут, превышены лимиты провайдера.
+  --
+  Резервный путь: маршрутизация по ключевым словам,
+  если и она молчит — общая линия.
+end note
+
+note bottom of mon
+  **Мониторинг и безопасность**
+  Следим: доля переадресаций оператором (главная метрика качества),
+  распределение по отделам, доля обращений на общей линии,
+  время до первого ответа, доля отказов внешнего сервиса.
+  Резкий рост переадресаций — откат на прошлую версию или на правила.
+  --
+  Текст обращения пишет клиент, поэтому наружу уходит только
+  обезличенный текст, а ответ модели — просто код отдела,
+  который сверяем со справочником, а не команда системе.
+  При обучении учитываем, что отделы появлялись в разное время.
+end note
+
+@enduml

@@ -1,0 +1,95 @@
+@startuml flagship-component
+' C4 Component. Сервис проверки операции
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+skinparam wrapWidth 200
+
+AddElementTag("code",  $bgColor="#1168BD", $fontColor="#FFFFFF", $legendText="Обычный код")
+AddElementTag("model", $bgColor="#7B3FA0", $fontColor="#FFFFFF", $legendText="ML-модель")
+AddElementTag("queue", $bgColor="#C77700", $fontColor="#FFFFFF", $legendText="Очередь")
+AddElementTag("human", $bgColor="#2E7D32", $fontColor="#FFFFFF", $legendText="Человек")
+AddElementTag("store", $bgColor="#4B5A66", $fontColor="#FFFFFF", $legendText="Данные")
+
+AddRelTag("sync",     $textColor="#1168BD", $lineColor="#1168BD", $legendText="Синхронно (до 300 мс)")
+AddRelTag("async",    $textColor="#C77700", $lineColor="#C77700", $lineStyle=DashedLine(), $legendText="Асинхронно")
+AddRelTag("fallback", $textColor="#B00020", $lineColor="#B00020", $lineStyle=BoldLine(), $legendText="Fallback")
+
+System_Ext(abs, "АБС / процессинг", "Вызывает проверку и применяет решение")
+ContainerDb_Ext(features, "Сервис признаков", "Агрегаты и свежесть признаков", $tags="store")
+Container_Ext(models, "Модели скоринга", "Базовая и усиленная", $tags="model")
+ContainerQueue_Ext(queue, "Очередь на ручной разбор", "Kafka + case management", $tags="queue")
+Person_Ext(analyst, "Аналитик финмона", "Решает по кейсу", $tags="human")
+ContainerDb_Ext(audit, "Журнал решений", "Что решили и почему", $tags="store")
+Container_Ext(mon, "Мониторинг", "Grafana", $tags="code")
+
+Container_Boundary(svc, "Сервис проверки операции") {
+  Component(intake, "Приём запроса", "REST/gRPC", "Проверяет схему запроса, повторный вызов по transaction_id возвращает то же решение", $tags="code")
+  Component(rules, "Правила (pre-gate)", "Rule engine", "Пропускает заведомо чистое, блокирует по стоп-листу, остальное — в скоринг", $tags="code")
+  Component(feat, "Сбор признаков", "Клиент feature store", "Забирает признаки и проверяет их свежесть и полноту", $tags="code")
+  Component(router, "Выбор модели", "Правила маршрутизации", "Крупная сумма или рисковый сегмент — усиленная модель", $tags="code")
+  Component(caller, "Вызов модели", "gRPC-клиент, таймаут и circuit breaker", "Один ретрай в рамках бюджета", $tags="code")
+  Component(check, "Проверка ответа модели", "Схема + пороги", "Оценка в [0,1], не вне области применимости, не в зоне воздержания, не спорит с правилом", $tags="code")
+  Component(policy, "Решение по порогам", "Пороговая логика", "ALLOW / REVIEW / HOLD / BLOCK и причины решения", $tags="code")
+  Component(fallback, "Fallback", "Аварийный путь", "Решение только по правилам, крупные суммы — на человека", $tags="fallback")
+  Component(builder, "Сборка и проверка ответа", "Response builder", "Заполняет поля контракта и проверяет его до отправки в АБС", $tags="code")
+  Component(publisher, "Публикация события", "Kafka producer", "Кейс на разбор, запись в журнал, метрики", $tags="code")
+}
+
+Rel(abs, intake, "Проверка операции до её проведения", $tags="sync")
+Rel(intake, rules, "Операция", $tags="sync")
+Rel(rules, builder, "Однозначный вердикт по правилам", $tags="sync")
+Rel(rules, feat, "Серая зона: нужен скоринг", $tags="sync")
+Rel(feat, features, "Запрос признаков", $tags="sync")
+Rel(feat, router, "Признаки свежие и полные", $tags="sync")
+Rel(router, caller, "Какую модель звать", $tags="sync")
+Rel(caller, models, "Оценка риска", $tags="sync")
+Rel(caller, check, "Ответ модели", $tags="sync")
+Rel(check, policy, "Оценке можно доверять", $tags="sync")
+Rel(policy, builder, "Решение и причины", $tags="sync")
+Rel(builder, abs, "Ответ по контракту", $tags="sync")
+
+Rel(feat, fallback, "Признаков нет, устарели или клиент без истории", $tags="fallback")
+Rel(caller, fallback, "Таймаут или модель недоступна", $tags="fallback")
+Rel(check, fallback, "Ответ не прошёл схему, зона воздержания, спор с правилом", $tags="fallback")
+Rel(fallback, policy, "Решение по правилам + пометка requires_human", $tags="fallback")
+
+Rel(policy, publisher, "REVIEW / HOLD — нужен человек", $tags="async")
+Rel(publisher, queue, "Кейс с приоритетом", $tags="async")
+Rel(queue, analyst, "Кейс: оценка, причины, признаки, ссылки на источники", $tags="async")
+Rel(analyst, abs, "Итоговое действие по операции", $tags="async")
+Rel(publisher, audit, "Решение и его основания", $tags="async")
+Rel(publisher, mon, "Метрики: fallback, воздержания, латентность", $tags="async")
+
+note right of builder
+  **Выходной контракт**
+  decision, risk_score (или null), source,
+  model_version, feature_snapshot_id,
+  reason_codes, requires_human, ttl.
+  Перед отправкой проверяем схему, диапазон оценки,
+  согласованность решения с порогом и срок годности ответа.
+  Нет признаков — score = null и REVIEW, а не ALLOW.
+end note
+
+note right of fallback
+  **Когда уходим с основного пути**
+  Признаков нет, устарели или неполны.
+  Значение вне того, что модель видела на обучении.
+  Клиент или сегмент без истории.
+  Оценка около порога (зона воздержания).
+  Оценка спорит с сигналом правила.
+  Модель или сервис признаков недоступны, таймаут.
+  Отказ внешнего сервиса или превышены лимиты.
+  --
+  Дальше: решение только по правилам,
+  крупные суммы — HOLD и ручной разбор.
+end note
+
+note right of intake
+  **Режим обработки**
+  Синхронно: весь путь до ответа, до 300 мс, один ретрай.
+  Асинхронно: ручной разбор, клиент ждёт снятия удержания.
+  Пакетно (вне сервиса): ночной пересчёт и переобучение.
+end note
+
+@enduml
